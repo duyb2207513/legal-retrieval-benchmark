@@ -47,7 +47,7 @@ BM25_BACKEND = os.getenv("BM25_BACKEND", "whoosh")
 # --- Rerank (retrieval/reranker.py) ---
 # Bật/tắt rerank sau RRF — tắt để so sánh A/B với pipeline cũ khi benchmark.
 USE_RERANK = os.getenv("USE_RERANK", "true").lower() == "true"
-RERANK_MIN_SCORE = float(os.getenv("RERANK_MIN_SCORE", "4.0"))
+RERANK_MIN_SCORE = float(os.getenv("RERANK_MIN_SCORE", "0.0"))
 
 # --- Bảng rank cấp văn bản (Component) — số nhỏ hơn = cấp cao hơn (nông hơn trong cây) ---
 LEVEL_RANK = {

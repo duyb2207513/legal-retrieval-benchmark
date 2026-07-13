@@ -13,10 +13,20 @@ from __future__ import annotations
 from config import MAX_CHARS_PER_UNIT
 
 
+# Định nghĩa thứ tự ưu tiên — số nhỏ hơn = ưu tiên cao hơn
+_VALIDITY_RANK = {
+    "Còn hiệu lực": 0,
+    "Hết hiệu lực một phần": 1,
+}
+_DEFAULT_VALIDITY_RANK = 2  # "Hết hiệu lực", "Không xác định", None, hoặc giá trị lạ khác
+
+
+def _validity_sort_key(status: str | None) -> int:
+    return _VALIDITY_RANK.get(status, _DEFAULT_VALIDITY_RANK)
+
+
 def build_context_flat(seeds: list[dict], max_chars_per_unit: int = MAX_CHARS_PER_UNIT) -> str:
-    """Ghép context từ danh sách seed phẳng (vector/bm25/hybrid) — không có
-    thông tin graph (Action, Norm cha nhiều cấp)."""
-    seeds = sorted(seeds, key=lambda r: r.get("validity_status") != "Còn hiệu lực")
+    seeds = sorted(seeds, key=lambda r: _validity_sort_key(r.get("validity_status")))
     parts = []
     for row in seeds:
         text = (row.get("text") or "")[:max_chars_per_unit]
@@ -46,7 +56,7 @@ def build_context_graph(subgraph: list[dict], max_chars_per_unit: int = MAX_CHAR
     """
     subgraph = sorted(
         subgraph,
-        key=lambda item: (item["n"] or {}).get("validity_status") != "Còn hiệu lực",
+        key=lambda item: _validity_sort_key((item["n"] or {}).get("validity_status")),
     )
     context = []
     for item in subgraph:

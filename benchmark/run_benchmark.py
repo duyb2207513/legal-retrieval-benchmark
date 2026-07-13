@@ -7,6 +7,7 @@ không cần ground truth), gộp thành bảng, lưu CSV vào benchmark/results
 from __future__ import annotations
 
 import argparse
+import ast
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -31,18 +32,59 @@ RESULTS_DIR = Path(__file__).parent / "results"
 DEFAULT_MAX_WORKERS = 4
 
 
-def _run_one_question(item: dict, modes: list[str], include_reason: bool = False) -> list[dict]:
+def load_precomputed_results(path: str | Path) -> dict[str, dict]:
+    """Đọc 1 file CSV kết quả run_pipeline đã chạy sẵn (vd
+    data/results/results_hybrid.csv, các cột: id, mode, question, result,
+    error), trả dict {question: result_dict} để tra cứu nhanh trong
+    _run_one_question thay vì gọi lại run_pipeline().
+
+    Bỏ qua các dòng có lỗi (cột "error" khác rỗng/NaN) — những câu hỏi này
+    sẽ tự động fallback sang gọi run_pipeline() bình thường vì không có
+    trong dict trả về.
+    """
+    df = pd.read_csv(path)
+    lookup: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        if pd.notna(row.get("error")):
+            continue
+        question = row["question"]
+        try:
+            result = ast.literal_eval(row["result"])
+        except (ValueError, SyntaxError):
+            logger.warning("Không parse được cột 'result' cho câu hỏi: %s...", str(question)[:80])
+            continue
+        lookup[question] = result
+    return lookup
+
+
+def _run_one_question(
+    item: dict,
+    modes: list[str],
+    include_reason: bool = False,
+    precomputed: dict[str, dict[str, dict]] | None = None,
+) -> list[dict]:
     """Chạy tuần tự tất cả mode cho 1 câu hỏi, trả list row (1 row/mode).
 
     Tách riêng thành hàm để mỗi câu hỏi có thể chạy trên 1 thread độc lập,
     còn các mode trong CÙNG câu hỏi vẫn chạy tuần tự — tránh tăng concurrency
     quá mức cần thiết (N câu hỏi song song đã đủ để giảm latency đáng kể).
+
+    precomputed: {mode: {question: result_dict}} — nếu mode có mặt ở đây VÀ
+    tìm thấy câu hỏi tương ứng, dùng lại result đã chạy sẵn (đọc từ CSV)
+    thay vì gọi run_pipeline() (tránh chạy lại retrieval tốn kém/tốn quota).
+    Mode không có trong precomputed, hoặc câu hỏi không tìm thấy trong đó,
+    vẫn chạy run_pipeline() như cũ.
     """
     question = item["question"]
     rows = []
     for mode in modes:
-        logger.info("Chạy mode=%s cho câu hỏi: %s...", mode, question[:80])
-        result = run_pipeline(question, mode)
+        cached = (precomputed or {}).get(mode, {}).get(question)
+        if cached is not None:
+            logger.info("Dùng kết quả có sẵn (precomputed) mode=%s cho câu hỏi: %s...", mode, question[:80])
+            result = cached
+        else:
+            logger.info("Chạy mode=%s cho câu hỏi: %s...", mode, question[:80])
+            result = run_pipeline(question, mode)
         deepeval_scores = score_with_deepeval(result, include_reason=include_reason)
 
         rows.append({
@@ -68,6 +110,7 @@ def run_benchmark(
     modes: list[str] = MODES,
     max_workers: int = DEFAULT_MAX_WORKERS,
     include_reason: bool = False,
+    precomputed: dict[str, dict[str, dict]] | None = None,
 ) -> pd.DataFrame:
     """Chạy run_pipeline() cho mỗi (câu hỏi, mode), chấm bằng DeepEval, trả
     DataFrame 1 dòng/(câu hỏi, mode).
@@ -82,10 +125,18 @@ def run_benchmark(
     định tắt. Bật lên khi cần hiểu TẠI SAO 1 metric thấp (vd faithfulness
     thấp: reason sẽ chỉ đúng câu/nhận định nào trong answer không có căn cứ
     trong context) thay vì chỉ nhìn con số.
+
+    precomputed: {mode: {question: result_dict}}, dùng khi đã có sẵn kết
+    quả run_pipeline() lưu ở CSV (vd data/results/results_hybrid.csv) và
+    chỉ muốn chấm điểm DeepEval lại mà KHÔNG chạy lại retrieval cho mode
+    đó. Dùng hàm load_precomputed_results() để build dict này từ CSV.
     """
     rows: list[dict] = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(_run_one_question, item, modes, include_reason): item for item in eval_set}
+        futures = {
+            ex.submit(_run_one_question, item, modes, include_reason, precomputed): item
+            for item in eval_set
+        }
         for future in as_completed(futures):
             item = futures[future]
             try:
@@ -130,12 +181,30 @@ def main() -> None:
         help="Bật DeepEval sinh giải thích cho từng metric (cột _*_reason trong "
              "CSV) — tốn thêm ~1 lần gọi LLM/metric/câu hỏi. Mặc định tắt.",
     )
+    parser.add_argument(
+        "--precomputed", nargs="+", default=[], metavar="MODE=PATH",
+        help="Dùng kết quả run_pipeline() đã chạy sẵn, lưu ở CSV, thay vì "
+             "chạy lại retrieval cho mode đó. Truyền dạng mode=path, có thể "
+             "lặp lại nhiều mode. VD: --precomputed hybrid=data/results/results_hybrid.csv. "
+             "Mode/câu hỏi nào không có trong CSV vẫn tự chạy run_pipeline() bình thường.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
 
+    precomputed: dict[str, dict[str, dict]] = {}
+    for spec in args.precomputed:
+        mode, _, path = spec.partition("=")
+        if not path:
+            raise ValueError(f"--precomputed phải có dạng mode=path, nhận được: {spec!r}")
+        precomputed[mode] = load_precomputed_results(path)
+        logger.info("Đã nạp %d kết quả có sẵn cho mode=%s từ %s", len(precomputed[mode]), mode, path)
+
     eval_set = load_eval_set(args.eval_set)
-    df_results = run_benchmark(eval_set, args.modes, max_workers=args.max_workers, include_reason=args.include_reason)
+    df_results = run_benchmark(
+        eval_set, args.modes, max_workers=args.max_workers,
+        include_reason=args.include_reason, precomputed=precomputed,
+    )
     summary = summarize(df_results)
 
     print("=== Trung bình theo mode (toàn bộ eval set) ===")

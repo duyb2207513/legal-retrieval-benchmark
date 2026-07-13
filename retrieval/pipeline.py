@@ -23,7 +23,7 @@ Quan trọng:
   vẫn giữ nguyên — tự tính bên trong.
 """
 from __future__ import annotations
-
+from retrieval.context_builder import _validity_sort_key
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -118,11 +118,9 @@ def retrieve(
     # "score" khi use_rerank=False (không có rerank_score) để giữ hành vi cũ.
     seeds = sorted(
         seeds,
-        key=lambda r: (r.get("validity_status") != "Còn hiệu lực", -r.get("rerank_score", r.get("score", 0))),
+        key=lambda r: (_validity_sort_key(r.get("validity_status")), -r.get("rerank_score", r.get("score", 0))),
     )
     return seeds[:max_components]
-
-
 def run_pipeline(
     question: str,
     mode: str,
